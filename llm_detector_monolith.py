@@ -6,7 +6,7 @@ Multi-layer stylometric detection pipeline for identifying LLM-generated
 or LLM-assisted task prompts in human data collection workflows.
 """
 
-__version__ = '0.65.0'
+__version__ = '0.65.1'
 
 # ============================================================================
 # STANDARD LIBRARY IMPORTS
@@ -5488,7 +5488,7 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
                    dna_model=None, dna_samples=3,
                    ground_truth=None, language=None, domain=None,
                    mode='auto', cal_table=None):
-    """Run full v0.61 pipeline on a single prompt. Returns result dict."""
+    """Run full v0.65 pipeline on a single prompt. Returns result dict."""
     # Normalization pre-pass
     normalized_text, norm_report = normalize_text(text)
     word_count_raw = len(text.split())
@@ -6214,7 +6214,7 @@ def print_result(r, verbose=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='LLM Detection Pipeline v0.61')
+    parser = argparse.ArgumentParser(description='LLM Detection Pipeline v0.65')
     parser.add_argument('input', nargs='?', help='Input file (.xlsx, .csv, or .pdf)')
     parser.add_argument('--gui', action='store_true', help='Launch desktop GUI mode')
     parser.add_argument('--text', help='Analyze a single text string')
@@ -6372,7 +6372,7 @@ def main():
 
     layer3_label = " + L3" if run_l3 else ""
     dna_label = " + DNA-GPT" if args.api_key else ""
-    print(f"Processing {len(tasks)} tasks through pipeline v0.61{layer3_label}{dna_label}...")
+    print(f"Processing {len(tasks)} tasks through pipeline v0.65{layer3_label}{dna_label}...")
 
     results = []
     text_map = {}
@@ -6399,7 +6399,7 @@ def main():
 
     det_counts = Counter(r['determination'] for r in results)
     print(f"\n{'='*90}")
-    print(f"  PIPELINE v0.61 RESULTS (n={len(results)})")
+    print(f"  PIPELINE v0.65 RESULTS (n={len(results)})")
     print(f"{'='*90}")
     for det in ['RED', 'AMBER', 'YELLOW', 'GREEN']:
         ct = det_counts.get(det, 0)
@@ -6503,94 +6503,325 @@ def main_gui():
     launch_gui()
 
 
-if __name__ == '__main__':
-    main()
-
-
 # ==============================================================================
 # DESKTOP GUI
 # ==============================================================================
-"""Desktop GUI for the LLM Detection Pipeline."""
-
-import os
-import threading
-from collections import Counter
-
-
 
 
 class DetectorGUI:
-    """Simple desktop GUI for single-text and file analysis."""
+    """Comprehensive desktop GUI exposing all pipeline features.
 
+    Tabbed layout:
+      - Analyze:   input file / pasted text, run analysis
+      - Settings:  detection mode, layer toggles, DNA-GPT params, similarity
+      - Memory:    memory store, calibration, baselines
+      - Reports:   output CSV, HTML reports, financial analysis
+    """
+
+    # ── construction ────────────────────────────────────────────────────────
     def __init__(self, root):
         self.root = root
-        self.root.title("LLM Detector Pipeline v0.61")
-        self.root.geometry("1040x760")
+        self.root.title(f"LLM Detector Pipeline v{__version__}")
+        self.root.geometry("1120x860")
+        self.root.minsize(900, 700)
 
+        # shared state
         self.file_var = tk.StringVar()
         self.prompt_col_var = tk.StringVar(value='prompt')
         self.sheet_var = tk.StringVar()
         self.attempter_var = tk.StringVar()
+        self.status_var = tk.StringVar(value='Ready')
+
+        # settings
+        self.mode_var = tk.StringVar(value='auto')
+        self.layer3_var = tk.BooleanVar(value=True)
+        self.verbose_var = tk.BooleanVar(value=False)
         self.provider_var = tk.StringVar(value='anthropic')
         self.api_key_var = tk.StringVar()
-        self.status_var = tk.StringVar(value='Ready')
+        self.dna_model_var = tk.StringVar()
+        self.dna_samples_var = tk.IntVar(value=3)
+
+        # similarity
+        self.similarity_var = tk.BooleanVar(value=True)
+        self.sim_threshold_var = tk.DoubleVar(value=0.40)
+        self.semantic_sim_var = tk.BooleanVar(value=False)
+        self.sim_store_var = tk.StringVar()
+        self.instructions_var = tk.StringVar()
+
+        # reports / output
+        self.output_csv_var = tk.StringVar()
+        self.html_dir_var = tk.StringVar()
+        self.cost_var = tk.DoubleVar(value=400.0)
+
+        # memory & calibration
+        self.memory_dir_var = tk.StringVar()
+        self.cal_table_var = tk.StringVar()
+        self.collect_var = tk.StringVar()
+        self.baselines_jsonl_var = tk.StringVar()
+        self.baselines_csv_var = tk.StringVar()
+
+        # runtime
+        self._results = []
+        self._text_map = {}
+        self._cancel = False
 
         self._build_layout()
 
+    # ── layout ──────────────────────────────────────────────────────────────
     def _build_layout(self):
-        frame = ttk.Frame(self.root, padding=10)
-        frame.pack(fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self.root, padding=6)
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        file_row = ttk.Frame(frame)
-        file_row.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(file_row, text='Input file (CSV/XLSX):').pack(side=tk.LEFT)
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill=tk.X, pady=(0, 6))
+
+        # Tab 1 — Analyze
+        tab_analyze = ttk.Frame(notebook, padding=8)
+        notebook.add(tab_analyze, text='  Analyze  ')
+        self._build_analyze_tab(tab_analyze)
+
+        # Tab 2 — Settings
+        tab_settings = ttk.Frame(notebook, padding=8)
+        notebook.add(tab_settings, text='  Settings  ')
+        self._build_settings_tab(tab_settings)
+
+        # Tab 3 — Memory & Calibration
+        tab_memory = ttk.Frame(notebook, padding=8)
+        notebook.add(tab_memory, text='  Memory & Calibration  ')
+        self._build_memory_tab(tab_memory)
+
+        # Tab 4 — Reports
+        tab_reports = ttk.Frame(notebook, padding=8)
+        notebook.add(tab_reports, text='  Reports & Output  ')
+        self._build_reports_tab(tab_reports)
+
+        # ── Text input area ─────────────────────────────────────────────────
+        ttk.Label(outer, text='Single text input (paste text for quick analysis):').pack(anchor='w')
+        self.text_input = tk.Text(outer, height=8, wrap=tk.WORD)
+        self.text_input.pack(fill=tk.X, pady=(2, 6))
+
+        # ── Action buttons ──────────────────────────────────────────────────
+        btn_bar = ttk.Frame(outer)
+        btn_bar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(btn_bar, text='Analyze Text', command=lambda: self._run_async(self._analyze_text)).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text='Analyze File', command=lambda: self._run_async(self._analyze_file)).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_bar, text='Stop', command=self._cancel_run).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text='Clear Output', command=self._clear_output).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_bar, text='Save Results CSV', command=self._save_results_csv).pack(side=tk.RIGHT)
+
+        # ── Progress ────────────────────────────────────────────────────────
+        self.progress = ttk.Progressbar(outer, mode='determinate')
+        self.progress.pack(fill=tk.X, pady=(0, 4))
+
+        # ── Results output area ─────────────────────────────────────────────
+        ttk.Label(outer, text='Results:').pack(anchor='w')
+        result_frame = ttk.Frame(outer)
+        result_frame.pack(fill=tk.BOTH, expand=True)
+        self.output = tk.Text(result_frame, height=18, wrap=tk.WORD)
+        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.output.yview)
+        self.output.configure(yscrollcommand=scrollbar.set)
+        self.output.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # colour tags for determinations
+        self.output.tag_configure('RED', foreground='#cc0000')
+        self.output.tag_configure('AMBER', foreground='#cc7700')
+        self.output.tag_configure('YELLOW', foreground='#999900')
+        self.output.tag_configure('GREEN', foreground='#007700')
+
+        # ── Status bar ──────────────────────────────────────────────────────
+        ttk.Label(outer, textvariable=self.status_var).pack(anchor='w', pady=(4, 0))
+
+    # ── Tab builders ────────────────────────────────────────────────────────
+
+    def _build_analyze_tab(self, parent):
+        # File input
+        file_row = ttk.Frame(parent)
+        file_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(file_row, text='Input file:').pack(side=tk.LEFT)
         ttk.Entry(file_row, textvariable=self.file_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         ttk.Button(file_row, text='Browse', command=self._browse_file).pack(side=tk.LEFT)
 
-        opts = ttk.Frame(frame)
-        opts.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(opts, text='Prompt column').grid(row=0, column=0, sticky='w')
-        ttk.Entry(opts, textvariable=self.prompt_col_var, width=18).grid(row=0, column=1, sticky='w', padx=6)
-        ttk.Label(opts, text='Sheet (xlsx)').grid(row=0, column=2, sticky='w')
-        ttk.Entry(opts, textvariable=self.sheet_var, width=16).grid(row=0, column=3, sticky='w', padx=6)
-        ttk.Label(opts, text='Attempter filter').grid(row=0, column=4, sticky='w')
-        ttk.Entry(opts, textvariable=self.attempter_var, width=18).grid(row=0, column=5, sticky='w', padx=6)
+        # Column / sheet / attempter
+        opts = ttk.Frame(parent)
+        opts.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(opts, text='Prompt column:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(opts, textvariable=self.prompt_col_var, width=16).grid(row=0, column=1, sticky='w', padx=4)
+        ttk.Label(opts, text='Sheet (xlsx):').grid(row=0, column=2, sticky='w', padx=(12, 0))
+        ttk.Entry(opts, textvariable=self.sheet_var, width=16).grid(row=0, column=3, sticky='w', padx=4)
+        ttk.Label(opts, text='Attempter filter:').grid(row=0, column=4, sticky='w', padx=(12, 0))
+        ttk.Entry(opts, textvariable=self.attempter_var, width=18).grid(row=0, column=5, sticky='w', padx=4)
 
-        l3 = ttk.LabelFrame(frame, text='Continuation Analysis (DNA-GPT)')
-        l3.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(l3, text='Provider').grid(row=0, column=0, sticky='w', padx=6, pady=6)
-        ttk.Combobox(l3, textvariable=self.provider_var, values=['anthropic', 'openai'], width=12, state='readonly').grid(row=0, column=1, sticky='w', pady=6)
-        ttk.Label(l3, text='API Key (optional)').grid(row=0, column=2, sticky='w', padx=(16, 6), pady=6)
-        ttk.Entry(l3, textvariable=self.api_key_var, show='*').grid(row=0, column=3, sticky='ew', padx=(0, 6), pady=6)
-        l3.columnconfigure(3, weight=1)
+    def _build_settings_tab(self, parent):
+        # Detection mode
+        mode_frame = ttk.LabelFrame(parent, text='Detection Mode')
+        mode_frame.pack(fill=tk.X, pady=(0, 8))
+        modes = ttk.Frame(mode_frame, padding=6)
+        modes.pack(fill=tk.X)
+        for val, label in [('auto', 'Auto'), ('task_prompt', 'Task Prompt'), ('generic_aigt', 'Generic AIGT')]:
+            ttk.Radiobutton(modes, text=label, variable=self.mode_var, value=val).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(modes, text='Layer 3 (NSSI + DNA-GPT)', variable=self.layer3_var).pack(side=tk.LEFT, padx=(24, 8))
+        ttk.Checkbutton(modes, text='Verbose output', variable=self.verbose_var).pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(frame, text='Single text input (optional):').pack(anchor='w')
-        self.text_input = tk.Text(frame, height=10, wrap=tk.WORD)
-        self.text_input.pack(fill=tk.BOTH, pady=(4, 8))
+        # DNA-GPT settings
+        dna_frame = ttk.LabelFrame(parent, text='DNA-GPT / Continuation Analysis')
+        dna_frame.pack(fill=tk.X, pady=(0, 8))
+        dna = ttk.Frame(dna_frame, padding=6)
+        dna.pack(fill=tk.X)
+        ttk.Label(dna, text='Provider:').grid(row=0, column=0, sticky='w')
+        ttk.Combobox(dna, textvariable=self.provider_var, values=['anthropic', 'openai'], width=12, state='readonly').grid(row=0, column=1, sticky='w', padx=4)
+        ttk.Label(dna, text='API Key:').grid(row=0, column=2, sticky='w', padx=(16, 0))
+        ttk.Entry(dna, textvariable=self.api_key_var, show='*', width=36).grid(row=0, column=3, sticky='ew', padx=4)
+        ttk.Label(dna, text='Model:').grid(row=0, column=4, sticky='w', padx=(16, 0))
+        ttk.Entry(dna, textvariable=self.dna_model_var, width=20).grid(row=0, column=5, sticky='w', padx=4)
+        ttk.Label(dna, text='Samples:').grid(row=0, column=6, sticky='w', padx=(16, 0))
+        ttk.Spinbox(dna, textvariable=self.dna_samples_var, from_=1, to=10, width=4).grid(row=0, column=7, sticky='w', padx=4)
+        dna.columnconfigure(3, weight=1)
 
-        actions = ttk.Frame(frame)
-        actions.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(actions, text='Analyze Text', command=lambda: self._run_async(self._analyze_text)).pack(side=tk.LEFT)
-        ttk.Button(actions, text='Analyze File', command=lambda: self._run_async(self._analyze_file)).pack(side=tk.LEFT, padx=8)
-        ttk.Button(actions, text='Clear Output', command=self._clear_output).pack(side=tk.LEFT)
+        # Similarity settings
+        sim_frame = ttk.LabelFrame(parent, text='Cross-Submission Similarity')
+        sim_frame.pack(fill=tk.X, pady=(0, 8))
+        sim = ttk.Frame(sim_frame, padding=6)
+        sim.pack(fill=tk.X)
+        ttk.Checkbutton(sim, text='Enable similarity analysis', variable=self.similarity_var).grid(row=0, column=0, sticky='w')
+        ttk.Label(sim, text='Jaccard threshold:').grid(row=0, column=1, sticky='w', padx=(20, 0))
+        ttk.Spinbox(sim, textvariable=self.sim_threshold_var, from_=0.1, to=1.0, increment=0.05, width=6, format='%.2f').grid(row=0, column=2, sticky='w', padx=4)
+        ttk.Checkbutton(sim, text='Semantic similarity', variable=self.semantic_sim_var).grid(row=0, column=3, sticky='w', padx=(20, 0))
 
-        ttk.Label(frame, text='Results:').pack(anchor='w')
-        self.output = tk.Text(frame, height=20, wrap=tk.WORD)
-        self.output.pack(fill=tk.BOTH, expand=True)
+        sim2 = ttk.Frame(sim_frame, padding=(6, 0, 6, 6))
+        sim2.pack(fill=tk.X)
+        ttk.Label(sim2, text='Similarity store:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(sim2, textvariable=self.sim_store_var, width=30).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(sim2, text='Browse', command=lambda: self._browse_save(self.sim_store_var, [('JSONL', '*.jsonl')])).grid(row=0, column=2, padx=(0, 16))
+        ttk.Label(sim2, text='Instructions file:').grid(row=0, column=3, sticky='w')
+        ttk.Entry(sim2, textvariable=self.instructions_var, width=30).grid(row=0, column=4, sticky='ew', padx=4)
+        ttk.Button(sim2, text='Browse', command=lambda: self._browse_open(self.instructions_var, [('Text', '*.txt'), ('All', '*.*')])).grid(row=0, column=5)
+        sim2.columnconfigure(1, weight=1)
+        sim2.columnconfigure(4, weight=1)
 
-        ttk.Label(frame, textvariable=self.status_var).pack(anchor='w', pady=(8, 0))
+    def _build_memory_tab(self, parent):
+        # Memory store
+        mem_frame = ttk.LabelFrame(parent, text='Memory Store (BEET)')
+        mem_frame.pack(fill=tk.X, pady=(0, 8))
+        m = ttk.Frame(mem_frame, padding=6)
+        m.pack(fill=tk.X)
+        ttk.Label(m, text='Memory directory:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(m, textvariable=self.memory_dir_var, width=40).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(m, text='Browse', command=lambda: self._browse_dir(self.memory_dir_var)).grid(row=0, column=2, padx=(0, 16))
+        ttk.Button(m, text='Show Summary', command=lambda: self._run_async(self._memory_summary)).grid(row=0, column=3, padx=4)
+        m.columnconfigure(1, weight=1)
+
+        m2 = ttk.Frame(mem_frame, padding=(6, 0, 6, 6))
+        m2.pack(fill=tk.X)
+        ttk.Label(m2, text='Attempter history:').grid(row=0, column=0, sticky='w')
+        self.history_name_var = tk.StringVar()
+        ttk.Entry(m2, textvariable=self.history_name_var, width=20).grid(row=0, column=1, sticky='w', padx=4)
+        ttk.Button(m2, text='Lookup', command=lambda: self._run_async(self._attempter_history_lookup)).grid(row=0, column=2, padx=4)
+        ttk.Button(m2, text='Rebuild Calibration', command=lambda: self._run_async(self._rebuild_calibration)).grid(row=0, column=3, padx=(20, 4))
+
+        # Calibration
+        cal_frame = ttk.LabelFrame(parent, text='Conformal Calibration')
+        cal_frame.pack(fill=tk.X, pady=(0, 8))
+        c = ttk.Frame(cal_frame, padding=6)
+        c.pack(fill=tk.X)
+        ttk.Label(c, text='Calibration table (JSON):').grid(row=0, column=0, sticky='w')
+        ttk.Entry(c, textvariable=self.cal_table_var, width=40).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(c, text='Browse', command=lambda: self._browse_open(self.cal_table_var, [('JSON', '*.json')])).grid(row=0, column=2, padx=4)
+        c.columnconfigure(1, weight=1)
+
+        # Baselines
+        base_frame = ttk.LabelFrame(parent, text='Baseline Collection & Analysis')
+        base_frame.pack(fill=tk.X, pady=(0, 8))
+        b = ttk.Frame(base_frame, padding=6)
+        b.pack(fill=tk.X)
+        ttk.Label(b, text='Collect results to JSONL:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(b, textvariable=self.collect_var, width=30).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(b, text='Browse', command=lambda: self._browse_save(self.collect_var, [('JSONL', '*.jsonl')])).grid(row=0, column=2, padx=(0, 16))
+        b.columnconfigure(1, weight=1)
+
+        b2 = ttk.Frame(base_frame, padding=(6, 0, 6, 6))
+        b2.pack(fill=tk.X)
+        ttk.Label(b2, text='Analyze baselines JSONL:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(b2, textvariable=self.baselines_jsonl_var, width=30).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(b2, text='Browse', command=lambda: self._browse_open(self.baselines_jsonl_var, [('JSONL', '*.jsonl')])).grid(row=0, column=2, padx=(0, 8))
+        ttk.Label(b2, text='Output CSV:').grid(row=0, column=3, sticky='w')
+        ttk.Entry(b2, textvariable=self.baselines_csv_var, width=20).grid(row=0, column=4, sticky='ew', padx=4)
+        ttk.Button(b2, text='Run Analysis', command=lambda: self._run_async(self._analyze_baselines_action)).grid(row=0, column=5, padx=4)
+        b2.columnconfigure(1, weight=1)
+        b2.columnconfigure(4, weight=1)
+
+    def _build_reports_tab(self, parent):
+        # Output CSV
+        out_frame = ttk.LabelFrame(parent, text='Output')
+        out_frame.pack(fill=tk.X, pady=(0, 8))
+        o = ttk.Frame(out_frame, padding=6)
+        o.pack(fill=tk.X)
+        ttk.Label(o, text='Output CSV path:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(o, textvariable=self.output_csv_var, width=40).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(o, text='Browse', command=lambda: self._browse_save(self.output_csv_var, [('CSV', '*.csv')])).grid(row=0, column=2, padx=4)
+        o.columnconfigure(1, weight=1)
+
+        # HTML reports
+        html_frame = ttk.LabelFrame(parent, text='HTML Reports')
+        html_frame.pack(fill=tk.X, pady=(0, 8))
+        h = ttk.Frame(html_frame, padding=6)
+        h.pack(fill=tk.X)
+        ttk.Label(h, text='HTML report directory:').grid(row=0, column=0, sticky='w')
+        ttk.Entry(h, textvariable=self.html_dir_var, width=40).grid(row=0, column=1, sticky='ew', padx=4)
+        ttk.Button(h, text='Browse', command=lambda: self._browse_dir(self.html_dir_var)).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(h, text='Generate Reports', command=lambda: self._run_async(self._generate_html_reports)).grid(row=0, column=3, padx=4)
+        h.columnconfigure(1, weight=1)
+
+        # Financial analysis
+        fin_frame = ttk.LabelFrame(parent, text='Financial Impact')
+        fin_frame.pack(fill=tk.X, pady=(0, 8))
+        f = ttk.Frame(fin_frame, padding=6)
+        f.pack(fill=tk.X)
+        ttk.Label(f, text='Cost per prompt ($):').grid(row=0, column=0, sticky='w')
+        ttk.Spinbox(f, textvariable=self.cost_var, from_=0, to=100000, increment=50, width=10, format='%.2f').grid(row=0, column=1, sticky='w', padx=4)
+        ttk.Button(f, text='Show Financial Impact', command=lambda: self._run_async(self._show_financial)).grid(row=0, column=2, padx=(16, 4))
+        ttk.Button(f, text='Show Attempter Profiles', command=lambda: self._run_async(self._show_attempter_profiles)).grid(row=0, column=3, padx=4)
+
+    # ── file dialog helpers ─────────────────────────────────────────────────
 
     def _browse_file(self):
-        path = filedialog.askopenfilename(filetypes=[('Data files', '*.csv *.xlsx *.xlsm'), ('All files', '*.*')])
+        path = filedialog.askopenfilename(filetypes=[
+            ('Data files', '*.csv *.xlsx *.xlsm *.pdf'),
+            ('CSV', '*.csv'), ('Excel', '*.xlsx *.xlsm'), ('PDF', '*.pdf'),
+            ('All files', '*.*'),
+        ])
         if path:
             self.file_var.set(path)
 
+    def _browse_open(self, var, filetypes):
+        path = filedialog.askopenfilename(filetypes=filetypes + [('All files', '*.*')])
+        if path:
+            var.set(path)
+
+    def _browse_save(self, var, filetypes):
+        path = filedialog.asksaveasfilename(filetypes=filetypes + [('All files', '*.*')])
+        if path:
+            var.set(path)
+
+    def _browse_dir(self, var):
+        path = filedialog.askdirectory()
+        if path:
+            var.set(path)
+
+    # ── async runner ────────────────────────────────────────────────────────
+
     def _clear_output(self):
         self.output.delete('1.0', tk.END)
+        self.progress['value'] = 0
         self.status_var.set('Ready')
+
+    def _cancel_run(self):
+        self._cancel = True
+        self.status_var.set('Cancelling...')
 
     def _run_async(self, fn):
         self.status_var.set('Running...')
+        self._cancel = False
 
         def runner():
             try:
@@ -6598,74 +6829,399 @@ class DetectorGUI:
                 self.root.after(0, lambda: self.status_var.set('Done'))
             except Exception as exc:
                 self.root.after(0, lambda: self.status_var.set('Error'))
-                self.root.after(0, lambda: messagebox.showerror('Analysis Error', str(exc)))
+                self.root.after(0, lambda e=exc: messagebox.showerror('Error', str(e)))
 
         threading.Thread(target=runner, daemon=True).start()
 
-    def _append(self, text):
-        self.root.after(0, lambda: (self.output.insert(tk.END, text), self.output.see(tk.END)))
+    def _append(self, text, tag=None):
+        def _do():
+            if tag:
+                self.output.insert(tk.END, text, tag)
+            else:
+                self.output.insert(tk.END, text)
+            self.output.see(tk.END)
+        self.root.after(0, _do)
+
+    def _set_progress(self, current, total):
+        pct = (current / total * 100) if total else 0
+        self.root.after(0, lambda: self.progress.configure(value=pct))
+        self.root.after(0, lambda: self.status_var.set(f'Processing {current}/{total}...'))
+
+    # ── common helpers ──────────────────────────────────────────────────────
+
+    def _get_api_key(self):
+        key = self.api_key_var.get().strip()
+        if key:
+            return key
+        env = 'ANTHROPIC_API_KEY' if self.provider_var.get() == 'anthropic' else 'OPENAI_API_KEY'
+        return os.environ.get(env)
+
+    def _get_cal_table(self):
+        path = self.cal_table_var.get().strip()
+        if path and os.path.exists(path):
+            return load_calibration(path)
+        return None
+
+    def _get_memory_store(self):
+        path = self.memory_dir_var.get().strip()
+        if path:
+            return MemoryStore(path)
+        return None
+
+    def _load_tasks(self):
+        path = self.file_var.get().strip()
+        if not path:
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        if ext in ('.xlsx', '.xlsm'):
+            tasks = load_xlsx(path, sheet=self.sheet_var.get().strip() or None,
+                              prompt_col=self.prompt_col_var.get().strip() or 'prompt')
+        elif ext == '.csv':
+            tasks = load_csv(path, prompt_col=self.prompt_col_var.get().strip() or 'prompt')
+        elif ext == '.pdf':
+            tasks = load_pdf(path)
+        else:
+            raise ValueError(f'Unsupported file type: {ext}')
+        needle = self.attempter_var.get().strip().lower()
+        if needle:
+            tasks = [t for t in tasks if needle in t.get('attempter', '').lower()]
+        return tasks
+
+    # ── format helpers ──────────────────────────────────────────────────────
+
+    def _format_result_short(self, result):
+        det = result.get('determination', '?')
+        return (
+            f"{det} | conf={result.get('confidence', 0):.2f} | "
+            f"words={result.get('word_count', 0)} | {result.get('reason', '')}"
+        )
+
+    def _format_result_verbose(self, result):
+        lines = []
+        det = result.get('determination', '?')
+        lines.append(f"  {det} (confidence={result.get('confidence', 0):.3f})")
+        lines.append(f"  Task: {result.get('task_id', '')}  Occupation: {result.get('occupation', '')}")
+        lines.append(f"  Words: {result.get('word_count', 0)}  Language: {result.get('language', '')}")
+        lines.append(f"  Reason: {result.get('reason', '')}")
+        lines.append(f"  Preamble: {result.get('preamble_score', 0):.3f}  Fingerprint: {result.get('fingerprint_score', 0):.3f}")
+        ps = result.get('prompt_signature_cfd')
+        if ps is not None:
+            lines.append(f"  Prompt Signature CFD: {ps:.3f}")
+        vd = result.get('voice_dissonance_vsd')
+        if vd is not None:
+            lines.append(f"  Voice Dissonance VSD: {vd:.3f}")
+        idi = result.get('instruction_density_idi')
+        if idi is not None:
+            lines.append(f"  Instruction Density IDI: {idi:.3f}")
+        nssi = result.get('self_similarity_nssi')
+        if nssi is not None:
+            lines.append(f"  Self-Similarity NSSI: {nssi:.3f}")
+        cont = result.get('continuation_bscore')
+        if cont is not None:
+            lines.append(f"  Continuation B-score: {cont:.3f}")
+        cd = result.get('channel_details')
+        if cd:
+            ch_parts = []
+            for ch_name, ch_data in cd.items():
+                if isinstance(ch_data, dict) and 'score' in ch_data:
+                    ch_parts.append(f"{ch_name}={ch_data['score']:.2f}")
+            if ch_parts:
+                lines.append(f"  Channels: {', '.join(ch_parts)}")
+        return '\n'.join(lines)
+
+    # ── analysis actions ────────────────────────────────────────────────────
 
     def _analyze_text(self):
         text = self.text_input.get('1.0', tk.END).strip()
         if not text:
             self.root.after(0, lambda: messagebox.showinfo('Input required', 'Enter text to analyze.'))
             return
+        cal_table = self._get_cal_table()
         result = analyze_prompt(
             text,
-            run_l3=True,
-            api_key=self.api_key_var.get().strip() or None,
+            run_l3=self.layer3_var.get(),
+            api_key=self._get_api_key(),
             dna_provider=self.provider_var.get(),
+            dna_model=self.dna_model_var.get().strip() or None,
+            dna_samples=self.dna_samples_var.get(),
+            mode=self.mode_var.get(),
+            cal_table=cal_table,
         )
-        self._append(self._format_result(result) + '\n')
+        self._results = [result]
+        self._text_map = {result.get('task_id', '_text'): text}
+        det = result.get('determination', '?')
+        if self.verbose_var.get():
+            self._append(self._format_result_verbose(result) + '\n\n', det)
+        else:
+            self._append(self._format_result_short(result) + '\n', det)
 
     def _analyze_file(self):
-        path = self.file_var.get().strip()
-        if not path:
-            self.root.after(0, lambda: messagebox.showinfo('Input required', 'Choose a CSV/XLSX file to analyze.'))
+        tasks = self._load_tasks()
+        if tasks is None:
+            self.root.after(0, lambda: messagebox.showinfo('Input required', 'Choose a file to analyze.'))
             return
-        ext = os.path.splitext(path)[1].lower()
-        if ext in ('.xlsx', '.xlsm'):
-            tasks = load_xlsx(path, sheet=self.sheet_var.get().strip() or None, prompt_col=self.prompt_col_var.get().strip() or 'prompt')
-        elif ext == '.csv':
-            tasks = load_csv(path, prompt_col=self.prompt_col_var.get().strip() or 'prompt')
-        else:
-            self.root.after(0, lambda: messagebox.showerror('Unsupported file', f'Unsupported extension: {ext}'))
-            return
-        if self.attempter_var.get().strip():
-            needle = self.attempter_var.get().strip().lower()
-            tasks = [t for t in tasks if needle in t.get('attempter', '').lower()]
         if not tasks:
             self.root.after(0, lambda: messagebox.showinfo('No tasks', 'No qualifying prompts found.'))
             return
 
-        api_key = self.api_key_var.get().strip() or None
+        api_key = self._get_api_key()
+        cal_table = self._get_cal_table()
+        run_l3 = self.layer3_var.get()
+        mode = self.mode_var.get()
+        dna_model = self.dna_model_var.get().strip() or None
+        dna_samples = self.dna_samples_var.get()
+        verbose = self.verbose_var.get()
+
+        results = []
+        text_map = {}
         counts = Counter()
+        total = len(tasks)
+
         for i, task in enumerate(tasks, 1):
+            if self._cancel:
+                self._append(f'\n--- Cancelled after {i-1}/{total} ---\n')
+                break
             r = analyze_prompt(
                 task['prompt'],
                 task_id=task.get('task_id', ''),
                 occupation=task.get('occupation', ''),
                 attempter=task.get('attempter', ''),
                 stage=task.get('stage', ''),
-                run_l3=True,
+                run_l3=run_l3,
                 api_key=api_key,
                 dna_provider=self.provider_var.get(),
+                dna_model=dna_model,
+                dna_samples=dna_samples,
+                mode=mode,
+                cal_table=cal_table,
             )
+            results.append(r)
+            tid = task.get('task_id', f'_row{i-1}')
+            text_map[tid] = task['prompt']
             counts[r['determination']] += 1
-            self._append(f"[{i}/{len(tasks)}] {self._format_result(r)}\n")
+            self._set_progress(i, total)
+            det = r.get('determination', '?')
+            if verbose:
+                self._append(f"[{i}/{total}]\n{self._format_result_verbose(r)}\n\n", det)
+            else:
+                self._append(f"[{i}/{total}] {self._format_result_short(r)}\n", det)
 
+        self._results = results
+        self._text_map = text_map
+
+        # Summary
         summary = (
-            f"\nSummary: RED={counts.get('RED', 0)} | AMBER={counts.get('AMBER', 0)} "
-            f"| YELLOW={counts.get('YELLOW', 0)} | GREEN={counts.get('GREEN', 0)}\n"
+            f"\n{'='*80}\n"
+            f"  PIPELINE v{__version__} RESULTS (n={len(results)})\n"
+            f"{'='*80}\n"
+            f"  RED: {counts.get('RED', 0)} | AMBER: {counts.get('AMBER', 0)} "
+            f"| YELLOW: {counts.get('YELLOW', 0)} | GREEN: {counts.get('GREEN', 0)}\n"
         )
         self._append(summary)
 
-    @staticmethod
-    def _format_result(result):
-        return (
-            f"{result.get('determination')} | conf={result.get('confidence', 0):.2f} | "
-            f"words={result.get('word_count', 0)} | reason={result.get('reason', '')}"
-        )
+        # Similarity analysis
+        if self.similarity_var.get() and len(results) >= 2:
+            instruction_shingles = None
+            instr_path = self.instructions_var.get().strip()
+            if instr_path and os.path.exists(instr_path):
+                with open(instr_path, 'r') as f:
+                    instruction_shingles = _word_shingles(f.read())
+            sim_pairs = analyze_similarity(
+                results, text_map,
+                jaccard_threshold=self.sim_threshold_var.get(),
+                semantic=self.semantic_sim_var.get(),
+                instruction_shingles=instruction_shingles,
+                similarity_store_path=self.sim_store_var.get().strip() or None,
+            )
+            n_upgrades = apply_similarity_feedback(results, sim_pairs)
+            if sim_pairs:
+                self._append(f"\n  SIMILARITY: {len(sim_pairs)} pairs found\n")
+                for p in sim_pairs[:10]:
+                    self._append(f"    {p['id_a'][:15]} <-> {p['id_b'][:15]} (J={p['jaccard']:.2f})\n")
+                if len(sim_pairs) > 10:
+                    self._append(f"    ... and {len(sim_pairs) - 10} more\n")
+            if n_upgrades:
+                self._append(f"  {n_upgrades} determination(s) upgraded via similarity feedback\n")
+
+        # Baseline collection
+        collect_path = self.collect_var.get().strip()
+        if collect_path and results:
+            collect_baselines(results, collect_path)
+            self._append(f"\n  Baselines appended to: {collect_path}\n")
+
+        # Memory store
+        store = self._get_memory_store()
+        if store and results:
+            cross_flags = store.cross_batch_similarity(results, text_map)
+            if cross_flags:
+                self._append(f"\n  CROSS-BATCH MEMORY: {len(cross_flags)} matches\n")
+                for cf in cross_flags[:5]:
+                    self._append(f"    {cf['current_id'][:15]} <-> {cf['historical_id'][:15]} "
+                                 f"(MH={cf['minhash_similarity']:.2f})\n")
+            store.record_batch(results, text_map)
+            self._append("  Batch recorded to memory store.\n")
+
+        # Auto-save CSV
+        csv_path = self.output_csv_var.get().strip()
+        if csv_path and results:
+            self._write_csv(results, csv_path)
+            self._append(f"\n  Results saved to: {csv_path}\n")
+
+    # ── report & post-analysis actions ──────────────────────────────────────
+
+    def _save_results_csv(self):
+        if not self._results:
+            messagebox.showinfo('No results', 'Run an analysis first.')
+            return
+        path = self.output_csv_var.get().strip()
+        if not path:
+            path = filedialog.asksaveasfilename(filetypes=[('CSV', '*.csv')], defaultextension='.csv')
+        if not path:
+            return
+        self.output_csv_var.set(path)
+        self._write_csv(self._results, path)
+        self.status_var.set(f'Saved {len(self._results)} results to {os.path.basename(path)}')
+
+    def _write_csv(self, results, path):
+        flat = []
+        for r in results:
+            row = {k: v for k, v in r.items() if k != 'preamble_details'}
+            row['preamble_details'] = str(r.get('preamble_details', []))
+            flat.append(row)
+        pd.DataFrame(flat).to_csv(path, index=False)
+
+    def _generate_html_reports(self):
+        if not self._results:
+            self.root.after(0, lambda: messagebox.showinfo('No results', 'Run an analysis first.'))
+            return
+        html_dir = self.html_dir_var.get().strip()
+        if not html_dir:
+            html_dir = filedialog.askdirectory(title='Select directory for HTML reports')
+        if not html_dir:
+            return
+        self.html_dir_var.set(html_dir)
+        flagged = [r for r in self._results if r['determination'] in ('RED', 'AMBER')]
+        if not flagged:
+            self._append("\n  No flagged (RED/AMBER) submissions to report.\n")
+            return
+        os.makedirs(html_dir, exist_ok=True)
+        for r in flagged:
+            tid = r.get('task_id', 'unknown')[:20]
+            path = os.path.join(html_dir, f"{tid}_{r['determination']}.html")
+            generate_html_report(self._text_map.get(r.get('task_id', ''), ''), r, path)
+        self._append(f"\n  HTML reports written to {html_dir}/ ({len(flagged)} files)\n")
+
+    def _show_financial(self):
+        if not self._results or len(self._results) < 2:
+            self.root.after(0, lambda: messagebox.showinfo('Insufficient data', 'Need analysis results (2+ submissions).'))
+            return
+        cost = self.cost_var.get()
+        impact = financial_impact(self._results, cost_per_prompt=cost)
+        lines = [
+            f"\n{'='*60}",
+            f"  FINANCIAL IMPACT (cost/prompt=${cost:.0f})",
+            f"{'='*60}",
+            f"  Total submissions:  {impact['total_submissions']}",
+            f"  Flagged (RED+AMBER): {impact['flagged_count']}",
+            f"  Flag rate:          {impact['flag_rate']:.1%}",
+            f"  Estimated waste:    ${impact['estimated_waste']:,.0f}",
+            f"  Potential savings:  ${impact['potential_savings']:,.0f}",
+            "",
+        ]
+        self._append('\n'.join(lines))
+
+    def _show_attempter_profiles(self):
+        if not self._results or len(self._results) < 5:
+            self.root.after(0, lambda: messagebox.showinfo('Insufficient data', 'Need 5+ results for profiling.'))
+            return
+        profiles = profile_attempters(self._results)
+        if not profiles:
+            self._append("\n  No attempter profiles (not enough data per attempter).\n")
+            return
+        self._append(f"\n{'='*60}\n  ATTEMPTER PROFILES\n{'='*60}\n")
+        for p in profiles:
+            self._append(
+                f"  {p['attempter'][:30]:30} | submissions={p['total']:>3} "
+                f"| flagged={p['flagged']:>3} ({p['flag_rate']:.0%}) "
+                f"| avg_conf={p['avg_confidence']:.2f}\n"
+            )
+        self._append('\n')
+
+    # ── memory actions ──────────────────────────────────────────────────────
+
+    def _memory_summary(self):
+        store = self._get_memory_store()
+        if not store:
+            self.root.after(0, lambda: messagebox.showinfo('No memory', 'Set a memory store directory first.'))
+            return
+        import io
+        buf = io.StringIO()
+        _orig_print = __builtins__['print'] if isinstance(__builtins__, dict) else __builtins__.print
+        def _capture(*args, **kwargs):
+            kwargs['file'] = buf
+            _orig_print(*args, **kwargs)
+        import builtins
+        old = builtins.print
+        builtins.print = _capture
+        try:
+            store.print_summary()
+        finally:
+            builtins.print = old
+        self._append(f"\n{buf.getvalue()}\n")
+
+    def _attempter_history_lookup(self):
+        store = self._get_memory_store()
+        if not store:
+            self.root.after(0, lambda: messagebox.showinfo('No memory', 'Set a memory store directory first.'))
+            return
+        name = self.history_name_var.get().strip()
+        if not name:
+            self.root.after(0, lambda: messagebox.showinfo('Input required', 'Enter an attempter name.'))
+            return
+        history = store.get_attempter_history(name)
+        if not history or not history.get('submissions'):
+            self._append(f"\n  No history found for attempter '{name}'.\n")
+            return
+        self._append(f"\n{'='*60}\n  ATTEMPTER HISTORY: {name}\n{'='*60}\n")
+        self._append(f"  Risk tier: {history.get('risk_tier', 'unknown')}\n")
+        self._append(f"  Total submissions: {len(history.get('submissions', []))}\n")
+        for s in history.get('submissions', [])[-10:]:
+            self._append(f"    {s.get('task_id', '')[:20]:20} | {s.get('determination', '')} "
+                         f"| conf={s.get('confidence', 0):.2f}\n")
+        self._append('\n')
+
+    def _rebuild_calibration(self):
+        store = self._get_memory_store()
+        if not store:
+            self.root.after(0, lambda: messagebox.showinfo('No memory', 'Set a memory store directory first.'))
+            return
+        import io
+        buf = io.StringIO()
+        import builtins
+        old = builtins.print
+        builtins.print = lambda *a, **kw: old(*a, **{**kw, 'file': buf})
+        try:
+            store.rebuild_calibration()
+        finally:
+            builtins.print = old
+        self._append(f"\n  Calibration rebuilt.\n{buf.getvalue()}\n")
+
+    def _analyze_baselines_action(self):
+        jsonl = self.baselines_jsonl_var.get().strip()
+        if not jsonl or not os.path.exists(jsonl):
+            self.root.after(0, lambda: messagebox.showinfo('Input required', 'Select a baselines JSONL file.'))
+            return
+        csv_out = self.baselines_csv_var.get().strip() or None
+        import io
+        buf = io.StringIO()
+        import builtins
+        old = builtins.print
+        builtins.print = lambda *a, **kw: old(*a, **{**kw, 'file': buf})
+        try:
+            analyze_baselines(jsonl, output_csv=csv_out)
+        finally:
+            builtins.print = old
+        self._append(f"\n{buf.getvalue()}\n")
 
 
 def launch_gui():
