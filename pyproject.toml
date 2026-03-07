@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-detector"
+version = "0.61.0"
+description = "Multi-layer stylometric detection pipeline for identifying LLM-generated task prompts"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+
+dependencies = [
+    "pandas>=1.5",
+    "openpyxl>=3.0",
+]
+
+[project.optional-dependencies]
+api = [
+    "anthropic>=0.20",
+    "openai>=1.0",
+]
+nlp = [
+    "spacy>=3.0",
+    "ftfy>=6.0",
+    "sentence-transformers>=2.0",
+    "scikit-learn>=1.0",
+]
+perplexity = [
+    "transformers>=4.20",
+    "torch>=2.0",
+]
+pdf = [
+    "pypdf>=3.0",
+]
+all = [
+    "llm-detector[api,nlp,perplexity,pdf]",
+]
+bundle = [
+    "llm-detector[api,pdf]",
+    "pyinstaller>=6.0",
+]
+
+[project.scripts]
+llm-detector = "llm_detector_monolith:main"
+
+[project.gui-scripts]
+llm-detector-gui = "llm_detector_monolith:main_gui"
+
+[tool.setuptools]
+py-modules = ["llm_detector_monolith"]

@@ -1,0 +1,27 @@
+# Core dependencies
+pandas
+openpyxl
+
+# API providers for DNA-GPT continuation analysis
+anthropic
+openai
+
+# Optional: improves sentence segmentation
+# spacy
+
+# Optional: semantic vector analysis (Layer 2.8)
+# sentence-transformers
+# scikit-learn
+
+# Optional: local perplexity scoring
+# transformers
+# torch
+
+# Optional: robust text encoding repair
+# ftfy
+
+# Optional: PDF input support
+# pypdf
+
+# Bundling as standalone executable
+# pyinstaller

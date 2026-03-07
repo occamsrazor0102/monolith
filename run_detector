@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+"""LLM Detection Pipeline v0.61 — Launcher."""
+from llm_detector_monolith import main
+
+if __name__ == '__main__':
+    main()
