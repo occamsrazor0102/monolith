@@ -6258,6 +6258,519 @@ def print_result(r, verbose=False):
                     print(f"     {eligible} {ch_name:18s} {ch_info['severity']:6s} score={ch_info['score']:.2f}  {ch_info['explanation'][:60]}")
 
 
+# ==============================================================================
+# INTERACTIVE LABELING
+# ==============================================================================
+"""Interactive human-in-the-loop labeling for calibration data collection.
+
+After pipeline scoring, presents each result to the reviewer and collects
+ground truth labels. Prioritizes ambiguous cases (YELLOW, AMBER) where
+calibration benefits most from human judgment.
+"""
+
+
+def _sort_for_labeling(results):
+    """Sort results to prioritize cases where human labels are most valuable.
+
+    Order: YELLOW first (most ambiguous), then AMBER, then MIXED,
+    then RED (confirm true positives), then GREEN (confirm true negatives).
+    Within each tier, lower confidence first (harder calls first while fresh).
+    """
+    tier_order = {'YELLOW': 0, 'MIXED': 1, 'AMBER': 2, 'RED': 3, 'REVIEW': 4, 'GREEN': 5}
+    return sorted(results, key=lambda r: (
+        tier_order.get(r.get('determination', 'GREEN'), 6),
+        r.get('confidence', 0),
+    ))
+
+
+def _format_labeling_display(r, text_map=None, show_text_chars=300):
+    """Format a single result for the labeling interface."""
+    icons = {'RED': '\U0001f534', 'AMBER': '\U0001f7e0', 'YELLOW': '\U0001f7e1',
+             'GREEN': '\U0001f7e2', 'MIXED': '\U0001f535', 'REVIEW': '\u26aa'}
+    icon = icons.get(r['determination'], '?')
+
+    lines = []
+    lines.append(f"\n{'='*80}")
+    lines.append(f"  {icon} [{r['determination']}]  conf={r.get('confidence', 0):.2f}  "
+                 f"mode={r.get('mode', '?')}")
+    lines.append(f"  Task:      {r.get('task_id', '?')}")
+    lines.append(f"  Attempter: {r.get('attempter', '(unknown)')}")
+    lines.append(f"  Occupation:{r.get('occupation', '(unknown)')}")
+    lines.append(f"  Words:     {r.get('word_count', 0)}")
+    lines.append(f"  Reason:    {r.get('reason', '')[:120]}")
+
+    # Key signals summary
+    lines.append(f"\n  --- Key Signals ---")
+    lines.append(f"  Preamble:    {r.get('preamble_score', 0):.2f} ({r.get('preamble_severity', 'NONE')})")
+    lines.append(f"  Prompt Sig:  {r.get('prompt_signature_composite', 0):.2f} "
+                 f"(CFD={r.get('prompt_signature_cfd', 0):.3f})")
+    lines.append(f"  VSD:         {r.get('voice_dissonance_vsd', 0):.1f} "
+                 f"(voice={r.get('voice_dissonance_voice_score', 0):.1f} x "
+                 f"spec={r.get('voice_dissonance_spec_score', 0):.1f})")
+    lines.append(f"  IDI:         {r.get('instruction_density_idi', 0):.1f}")
+    lines.append(f"  NSSI:        {r.get('self_similarity_nssi_score', 0):.3f} "
+                 f"({r.get('self_similarity_nssi_signals', 0)} signals)")
+    lines.append(f"  DNA-GPT:     {r.get('continuation_bscore', 0):.4f} "
+                 f"({r.get('continuation_mode', 'n/a')})")
+
+    cd = r.get('channel_details', {}).get('channels', {})
+    if cd:
+        lines.append(f"\n  --- Channels ---")
+        for ch_name in ['prompt_structure', 'stylometry', 'continuation', 'windowing']:
+            info = cd.get(ch_name, {})
+            sev = info.get('severity', 'GREEN')
+            if sev != 'GREEN':
+                lines.append(f"  {ch_name:20s} {sev:6s}  {info.get('explanation', '')[:60]}")
+
+    # Text preview
+    if text_map and r.get('task_id') in text_map:
+        text = text_map[r['task_id']]
+        preview = text[:show_text_chars]
+        if len(text) > show_text_chars:
+            preview += f"... [{len(text) - show_text_chars} more chars]"
+        lines.append(f"\n  --- Text Preview ---")
+        lines.append(f"  {preview}")
+
+    lines.append(f"{'='*80}")
+    return '\n'.join(lines)
+
+
+def interactive_label(results, text_map=None, output_path=None, reviewer='',
+                      store=None, skip_green=False, skip_red=False,
+                      max_labels=None):
+    """Interactive labeling session for calibration data collection.
+
+    Presents each result to the reviewer and collects ground truth labels.
+    Saves labels to JSONL for calibration and optionally to a MemoryStore.
+
+    Args:
+        results: List of pipeline result dicts.
+        text_map: Optional dict mapping task_id -> original text.
+        output_path: JSONL path to append labeled records. If None, uses
+                     'beet_labels_{date}.jsonl'.
+        reviewer: Reviewer identifier string.
+        store: Optional MemoryStore for record_confirmation integration.
+        skip_green: Skip GREEN determinations (assume correct).
+        skip_red: Skip RED determinations (assume correct).
+        max_labels: Stop after this many labels (None = label all).
+
+    Returns:
+        dict with labeling session statistics.
+    """
+    if output_path is None:
+        output_path = f"beet_labels_{datetime.now().strftime('%Y%m%d_%H%M')}.jsonl"
+
+    sorted_results = _sort_for_labeling(results)
+
+    if skip_green:
+        sorted_results = [r for r in sorted_results if r['determination'] != 'GREEN']
+    if skip_red:
+        sorted_results = [r for r in sorted_results if r['determination'] != 'RED']
+
+    if max_labels:
+        sorted_results = sorted_results[:max_labels]
+
+    if not reviewer:
+        reviewer = input("  Reviewer name/ID: ").strip() or 'anonymous'
+
+    stats = {
+        'total_presented': 0,
+        'labeled_ai': 0,
+        'labeled_human': 0,
+        'labeled_unsure': 0,
+        'skipped': 0,
+        'true_positives': 0,   # pipeline flagged + human says AI
+        'false_positives': 0,  # pipeline flagged + human says human
+        'true_negatives': 0,   # pipeline clean + human says human
+        'false_negatives': 0,  # pipeline clean + human says AI
+        'reviewer': reviewer,
+    }
+
+    print(f"\n{'#'*80}")
+    print(f"  BEET INTERACTIVE LABELING SESSION")
+    print(f"  {len(sorted_results)} items to review | Reviewer: {reviewer}")
+    print(f"  Labels: (a)i  (h)uman  (u)nsure  (s)kip  (q)uit")
+    print(f"  Optional notes: type after label, e.g. 'a obvious template'")
+    print(f"{'#'*80}")
+
+    labeled_records = []
+
+    for i, r in enumerate(sorted_results):
+        stats['total_presented'] += 1
+
+        print(_format_labeling_display(r, text_map))
+        print(f"\n  [{i+1}/{len(sorted_results)}] Label this text:")
+
+        try:
+            raw = input("  > ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Session interrupted.")
+            break
+
+        if not raw:
+            stats['skipped'] += 1
+            continue
+
+        # Parse input: first char is label, rest is notes
+        label_char = raw[0].lower()
+        notes = raw[1:].strip() if len(raw) > 1 else ''
+
+        if label_char == 'q':
+            print("  Session ended by reviewer.")
+            break
+        elif label_char == 's':
+            stats['skipped'] += 1
+            continue
+        elif label_char == 'a':
+            ground_truth = 'ai'
+            stats['labeled_ai'] += 1
+        elif label_char == 'h':
+            ground_truth = 'human'
+            stats['labeled_human'] += 1
+        elif label_char == 'u':
+            ground_truth = 'unsure'
+            stats['labeled_unsure'] += 1
+        else:
+            print(f"  Unknown label '{label_char}' — skipping.")
+            stats['skipped'] += 1
+            continue
+
+        # Confusion matrix tracking
+        pipeline_flagged = r.get('determination') in ('RED', 'AMBER', 'MIXED')
+        if ground_truth == 'ai' and pipeline_flagged:
+            stats['true_positives'] += 1
+        elif ground_truth == 'human' and pipeline_flagged:
+            stats['false_positives'] += 1
+        elif ground_truth == 'human' and not pipeline_flagged:
+            stats['true_negatives'] += 1
+        elif ground_truth == 'ai' and not pipeline_flagged:
+            stats['false_negatives'] += 1
+
+        # Build labeled record
+        record = {
+            'task_id': r.get('task_id', ''),
+            'attempter': r.get('attempter', ''),
+            'occupation': r.get('occupation', ''),
+            'ground_truth': ground_truth,
+            'pipeline_determination': r.get('determination', ''),
+            'pipeline_confidence': r.get('confidence', 0),
+            'reviewer': reviewer,
+            'notes': notes,
+            'timestamp': datetime.now().isoformat(),
+            'pipeline_version': 'v0.65',
+            # Carry forward all scores for calibration
+            'confidence': r.get('confidence', 0),
+            'word_count': r.get('word_count', 0),
+            'domain': r.get('domain', ''),
+            'mode': r.get('mode', ''),
+        }
+
+        # Length bin for stratified calibration
+        wc = r.get('word_count', 0)
+        if wc < 100:
+            record['length_bin'] = 'short'
+        elif wc < 300:
+            record['length_bin'] = 'medium'
+        elif wc < 800:
+            record['length_bin'] = 'long'
+        else:
+            record['length_bin'] = 'very_long'
+
+        labeled_records.append(record)
+
+        # Write to JSONL immediately (crash-safe)
+        with open(output_path, 'a') as f:
+            f.write(json.dumps(record) + '\n')
+
+        # Write to memory store if available
+        if store and ground_truth in ('ai', 'human'):
+            store.record_confirmation(
+                r.get('task_id', ''), ground_truth,
+                verified_by=reviewer, notes=notes,
+            )
+
+        print(f"  Recorded: {ground_truth}" + (f" ({notes})" if notes else ""))
+
+    # Session summary
+    _print_labeling_summary(stats, output_path)
+
+    return stats
+
+
+def _print_labeling_summary(stats, output_path):
+    """Print end-of-session summary with calibration readiness check."""
+    total_labeled = stats['labeled_ai'] + stats['labeled_human'] + stats['labeled_unsure']
+
+    print(f"\n{'#'*80}")
+    print(f"  LABELING SESSION COMPLETE")
+    print(f"{'#'*80}")
+    print(f"  Reviewer:     {stats['reviewer']}")
+    print(f"  Presented:    {stats['total_presented']}")
+    print(f"  Labeled:      {total_labeled}")
+    print(f"    AI:         {stats['labeled_ai']}")
+    print(f"    Human:      {stats['labeled_human']}")
+    print(f"    Unsure:     {stats['labeled_unsure']}")
+    print(f"  Skipped:      {stats['skipped']}")
+
+    tp = stats['true_positives']
+    fp = stats['false_positives']
+    tn = stats['true_negatives']
+    fn = stats['false_negatives']
+
+    if tp + fp + tn + fn > 0:
+        print(f"\n  --- Pipeline Accuracy (this session) ---")
+        print(f"  True Positives:  {tp}  (flagged + confirmed AI)")
+        print(f"  False Positives: {fp}  (flagged + confirmed human)")
+        print(f"  True Negatives:  {tn}  (clean + confirmed human)")
+        print(f"  False Negatives: {fn}  (clean + confirmed AI)")
+
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        accuracy = (tp + tn) / max(tp + fp + tn + fn, 1)
+
+        print(f"\n  Precision:  {precision:.1%}")
+        print(f"  Recall:     {recall:.1%}")
+        print(f"  Accuracy:   {accuracy:.1%}")
+
+        if fp > 0:
+            fpr = fp / max(fp + tn, 1)
+            print(f"  FPR:        {fpr:.1%}")
+
+    # Calibration readiness
+    human_count = stats['labeled_human']
+    print(f"\n  --- Calibration Status ---")
+    if human_count >= 20:
+        print(f"  READY: {human_count} human labels (minimum 20 met)")
+        print(f"  Run: --calibrate {output_path}")
+    elif human_count >= 10:
+        print(f"  CLOSE: {human_count}/20 human labels — need {20 - human_count} more")
+    else:
+        print(f"  BUILDING: {human_count}/20 human labels — need {20 - human_count} more")
+
+    print(f"\n  Labels saved to: {output_path}")
+
+
+# ==============================================================================
+# CALIBRATION REPORT
+# ==============================================================================
+"""Calibration diagnostics report.
+
+Analyzes labeled data to show where the pipeline is well-calibrated vs. where
+it needs threshold adjustment.
+"""
+
+
+def calibration_report(jsonl_path, cal_table=None, output_csv=None):
+    """Generate a calibration diagnostics report from labeled data.
+
+    Shows:
+    - Reliability diagram (predicted confidence vs actual accuracy)
+    - Per-determination confusion matrix
+    - Per-stratum (domain x length) calibration quality
+    - Threshold sensitivity analysis
+    - Specific recommendations for threshold adjustment
+    """
+    records = []
+    with open(jsonl_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rec = json.loads(line)
+                    if rec.get('ground_truth') in ('ai', 'human'):
+                        records.append(rec)
+                except json.JSONDecodeError:
+                    continue
+
+    if len(records) < 5:
+        print(f"  Insufficient labeled data ({len(records)} records, need >= 5)")
+        return None
+
+    n_total = len(records)
+    n_human = sum(1 for r in records if r['ground_truth'] == 'human')
+    n_ai = sum(1 for r in records if r['ground_truth'] == 'ai')
+
+    print(f"\n{'='*80}")
+    print(f"  CALIBRATION DIAGNOSTICS REPORT")
+    print(f"  {n_total} labeled records ({n_human} human, {n_ai} AI)")
+    print(f"{'='*80}")
+
+    # 1. Confusion matrix by determination
+    print(f"\n  --- Confusion Matrix by Determination ---")
+    print(f"  {'Determination':<12} {'Human':>8} {'AI':>8} {'Total':>8} {'Precision':>10}")
+    print(f"  {'-'*50}")
+
+    for det in ['RED', 'AMBER', 'MIXED', 'YELLOW', 'GREEN', 'REVIEW']:
+        det_records = [r for r in records if r.get('pipeline_determination') == det]
+        if not det_records:
+            continue
+        det_human = sum(1 for r in det_records if r['ground_truth'] == 'human')
+        det_ai = sum(1 for r in det_records if r['ground_truth'] == 'ai')
+        det_total = len(det_records)
+        precision = det_ai / det_total if det in ('RED', 'AMBER', 'MIXED') else det_human / det_total
+        print(f"  {det:<12} {det_human:>8} {det_ai:>8} {det_total:>8} {precision:>9.1%}")
+
+    # 2. Reliability diagram (confidence bins)
+    print(f"\n  --- Reliability Diagram (Confidence Bins) ---")
+    print(f"  {'Bin':<12} {'Count':>6} {'AI Rate':>8} {'Mean Conf':>10} {'Gap':>8}")
+    print(f"  {'-'*50}")
+
+    bins = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.01)]
+    reliability_gaps = []
+
+    for lo, hi in bins:
+        bin_records = [r for r in records
+                       if lo <= r.get('pipeline_confidence', r.get('confidence', 0)) < hi]
+        if not bin_records:
+            continue
+
+        n_bin = len(bin_records)
+        ai_rate = sum(1 for r in bin_records if r['ground_truth'] == 'ai') / n_bin
+        mean_conf = statistics.mean(
+            r.get('pipeline_confidence', r.get('confidence', 0)) for r in bin_records)
+        gap = mean_conf - ai_rate
+        reliability_gaps.append(abs(gap))
+
+        print(f"  [{lo:.1f}-{hi:.1f})  {n_bin:>6} {ai_rate:>7.1%} {mean_conf:>9.2f} "
+              f"{'':>2}{'+' if gap > 0 else ''}{gap:>5.2f}")
+
+    ece = None
+    if reliability_gaps:
+        ece = statistics.mean(reliability_gaps)
+        print(f"\n  Expected Calibration Error (ECE): {ece:.3f}")
+        if ece < 0.10:
+            print(f"  Assessment: WELL CALIBRATED")
+        elif ece < 0.20:
+            print(f"  Assessment: MODERATELY CALIBRATED — consider recalibration")
+        else:
+            print(f"  Assessment: POORLY CALIBRATED — recalibration recommended")
+
+    # 3. TPR at fixed FPR
+    if n_human >= 5 and n_ai >= 5:
+        print(f"\n  --- TPR @ Fixed FPR ---")
+
+        scores = [r.get('pipeline_confidence', r.get('confidence', 0)) for r in records]
+        labels = [1 if r['ground_truth'] == 'ai' else 0 for r in records]
+
+        thresholds = sorted(set(scores), reverse=True)
+
+        for target_fpr, label in [(0.01, '1%'), (0.05, '5%'), (0.10, '10%')]:
+            best_tpr = 0.0
+            best_thresh = 1.0
+            for t in thresholds:
+                predicted_pos = [s >= t for s in scores]
+                fp = sum(1 for p, l in zip(predicted_pos, labels) if p and l == 0)
+                tp = sum(1 for p, l in zip(predicted_pos, labels) if p and l == 1)
+                fpr = fp / max(n_human, 1)
+                tpr = tp / max(n_ai, 1)
+                if fpr <= target_fpr and tpr > best_tpr:
+                    best_tpr = tpr
+                    best_thresh = t
+            print(f"  TPR @ {label:>3} FPR: {best_tpr:>6.1%}  (threshold={best_thresh:.3f})")
+
+    # 4. Per-stratum analysis
+    strata = defaultdict(list)
+    for r in records:
+        domain = r.get('domain', 'unknown') or 'unknown'
+        length_bin = r.get('length_bin', 'unknown') or 'unknown'
+        strata[f"{domain}x{length_bin}"].append(r)
+
+    if len(strata) > 1:
+        print(f"\n  --- Per-Stratum Calibration ---")
+        print(f"  {'Stratum':<30} {'N':>5} {'FP Rate':>8} {'FN Rate':>8} {'Flag Rate':>10}")
+        print(f"  {'-'*65}")
+
+        problem_strata = []
+
+        for stratum_key in sorted(strata.keys()):
+            s_records = strata[stratum_key]
+            if len(s_records) < 3:
+                continue
+
+            s_human = [r for r in s_records if r['ground_truth'] == 'human']
+            s_ai = [r for r in s_records if r['ground_truth'] == 'ai']
+
+            fp = sum(1 for r in s_human
+                     if r.get('pipeline_determination') in ('RED', 'AMBER', 'MIXED'))
+            fn = sum(1 for r in s_ai
+                     if r.get('pipeline_determination') in ('GREEN', 'YELLOW'))
+
+            fpr = fp / max(len(s_human), 1)
+            fnr = fn / max(len(s_ai), 1)
+
+            flagged = sum(1 for r in s_records
+                         if r.get('pipeline_determination') in ('RED', 'AMBER', 'MIXED'))
+            flag_rate = flagged / len(s_records)
+
+            print(f"  {stratum_key:<30} {len(s_records):>5} {fpr:>7.1%} {fnr:>7.1%} {flag_rate:>9.1%}")
+
+            if fpr > 0.15 or fnr > 0.30:
+                problem_strata.append((stratum_key, fpr, fnr))
+
+        if problem_strata:
+            print(f"\n  WARNING: Problem strata detected:")
+            for sk, fpr, fnr in problem_strata:
+                issues = []
+                if fpr > 0.15:
+                    issues.append(f"high FPR ({fpr:.0%})")
+                if fnr > 0.30:
+                    issues.append(f"high FNR ({fnr:.0%})")
+                print(f"    {sk}: {', '.join(issues)}")
+
+    # 5. False positive analysis
+    false_positives = [r for r in records
+                       if r['ground_truth'] == 'human'
+                       and r.get('pipeline_determination') in ('RED', 'AMBER', 'MIXED')]
+
+    if false_positives:
+        print(f"\n  --- False Positive Analysis ({len(false_positives)} cases) ---")
+
+        fp_confs = [r.get('pipeline_confidence', r.get('confidence', 0))
+                    for r in false_positives]
+        print(f"  Confidence range: {min(fp_confs):.2f} - {max(fp_confs):.2f} "
+              f"(mean={statistics.mean(fp_confs):.2f})")
+
+        fp_dets = Counter(r.get('pipeline_determination') for r in false_positives)
+        for det, count in fp_dets.most_common():
+            print(f"    {det}: {count}")
+
+        fp_modes = Counter(r.get('mode', '?') for r in false_positives)
+        if len(fp_modes) > 1:
+            print(f"  By mode: {dict(fp_modes)}")
+
+    # 6. Recommendations
+    print(f"\n  --- Recommendations ---")
+
+    if n_human < 20:
+        print(f"  [!] Need {20 - n_human} more human labels for conformal calibration")
+    else:
+        print(f"  [OK] Sufficient human labels ({n_human}) for calibration")
+        print(f"       Run: --calibrate {jsonl_path}")
+
+    if false_positives and len(false_positives) / max(n_human, 1) > 0.10:
+        print(f"  [!] FPR > 10% — consider raising detection thresholds")
+
+    false_negatives = [r for r in records
+                       if r['ground_truth'] == 'ai'
+                       and r.get('pipeline_determination') in ('GREEN', 'YELLOW')]
+    if false_negatives and len(false_negatives) / max(n_ai, 1) > 0.20:
+        print(f"  [!] FNR > 20% — review missed cases for new signal patterns")
+
+    # Output CSV if requested
+    if output_csv:
+        pd.DataFrame(records).to_csv(output_csv, index=False)
+        print(f"\n  Labeled data exported to: {output_csv}")
+
+    return {
+        'n_total': n_total,
+        'n_human': n_human,
+        'n_ai': n_ai,
+        'ece': ece,
+        'false_positives': len(false_positives) if false_positives else 0,
+        'false_negatives': len(false_negatives) if false_negatives else 0,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='LLM Detection Pipeline v0.65')
     parser.add_argument('input', nargs='?', help='Input file (.xlsx, .csv, or .pdf)')
@@ -6316,6 +6829,23 @@ def main():
                         help='Print memory store summary and exit')
     parser.add_argument('--rebuild-calibration', action='store_true',
                         help='Rebuild calibration from confirmed labels in memory store')
+    parser.add_argument('--label', action='store_true',
+                        help='Interactive labeling mode: review results and assign '
+                             'ground truth labels for calibration')
+    parser.add_argument('--label-output', metavar='JSONL',
+                        help='JSONL path for labeled records (default: auto-named)')
+    parser.add_argument('--label-reviewer', metavar='NAME',
+                        help='Reviewer name/ID for labeling session')
+    parser.add_argument('--label-skip-green', action='store_true',
+                        help='Skip GREEN determinations during labeling (assume correct)')
+    parser.add_argument('--label-skip-red', action='store_true',
+                        help='Skip RED determinations during labeling (assume correct)')
+    parser.add_argument('--label-max', type=int, metavar='N',
+                        help='Maximum number of items to label per session')
+    parser.add_argument('--calibration-report', metavar='JSONL',
+                        help='Generate calibration diagnostics report from labeled JSONL')
+    parser.add_argument('--calibration-report-csv', metavar='PATH',
+                        help='Export labeled data to CSV (use with --calibration-report)')
     args = parser.parse_args()
 
     if args.gui:
@@ -6355,6 +6885,17 @@ def main():
             print(f"ERROR: File not found: {args.analyze_baselines}")
             return
         analyze_baselines(args.analyze_baselines, output_csv=args.baselines_csv)
+        return
+
+    if args.calibration_report:
+        if not os.path.exists(args.calibration_report):
+            print(f"ERROR: File not found: {args.calibration_report}")
+            return
+        calibration_report(
+            args.calibration_report,
+            cal_table=cal_table,
+            output_csv=getattr(args, 'calibration_report_csv', None),
+        )
         return
 
     if args.calibrate:
@@ -6506,6 +7047,29 @@ def main():
             generate_html_report(
                 text_map.get(r.get('task_id', ''), ''), r, path)
         print(f"\n  HTML reports written to {args.html_report}/ ({len(flagged)} files)")
+
+    if getattr(args, 'label', False):
+        label_stats = interactive_label(
+            results, text_map,
+            output_path=getattr(args, 'label_output', None),
+            reviewer=getattr(args, 'label_reviewer', '') or '',
+            store=store,
+            skip_green=getattr(args, 'label_skip_green', False),
+            skip_red=getattr(args, 'label_skip_red', False),
+            max_labels=getattr(args, 'label_max', None),
+        )
+
+        # Auto-calibrate if enough labels collected
+        label_path = getattr(args, 'label_output', None) or \
+                     f"beet_labels_{datetime.now().strftime('%Y%m%d_%H%M')}.jsonl"
+        if os.path.exists(label_path):
+            human_count = label_stats.get('labeled_human', 0)
+            if human_count >= 20:
+                print(f"\n  Sufficient labels for calibration. Building table...")
+                cal = calibrate_from_baselines(label_path)
+                if cal:
+                    cal_out = label_path.replace('.jsonl', '_calibration.json')
+                    save_calibration(cal, cal_out)
 
     default_name = os.path.basename(args.input).rsplit('.', 1)[0] + '_pipeline_v065.csv'
     input_dir = os.path.dirname(os.path.abspath(args.input))
