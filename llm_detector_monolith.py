@@ -2861,6 +2861,51 @@ def run_continuation_api(text, api_key=None, provider='anthropic', model=None,
         'continuation_words': continuation_word_count, 'word_count': word_count,
     }
 
+
+def run_continuation_api_multi(text, api_key=None, provider='anthropic', model=None,
+                               n_samples=3, gammas=(0.3, 0.5, 0.7), temperature=0.7):
+    """Multi-truncation DNA-GPT API continuation analysis.
+
+    Runs continuation analysis at multiple truncation ratios and measures
+    stability of the composite BScore. High stability (low variance) across
+    truncation points is an AI signal (TDT, West et al., 2025).
+    """
+    bscores = []
+    full_result = None
+
+    for gamma in gammas:
+        result = run_continuation_api(text, api_key=api_key, provider=provider,
+                                      model=model, truncation_ratio=gamma,
+                                      n_samples=n_samples, temperature=temperature)
+        bs = result.get('bscore', 0.0)
+        bscores.append(bs)
+        if gamma == 0.5:
+            full_result = result
+
+    if full_result is None:
+        full_result = result
+
+    if len(bscores) >= 2:
+        bs_mean = statistics.mean(bscores)
+        bs_var = statistics.variance(bscores)
+        stability = max(0.0, 1.0 - (bs_var / 0.08))
+    else:
+        bs_mean = bscores[0] if bscores else 0.0
+        bs_var = 0.0
+        stability = 0.0
+
+    full_result['multi_bscores'] = [round(b, 4) for b in bscores]
+    full_result['bscore_variance'] = round(bs_var, 6)
+    full_result['bscore_stability'] = round(stability, 4)
+
+    # Stability boosts bscore when it agrees with the primary signal
+    if stability >= 0.75 and bs_mean >= 0.12:
+        boosted = min(full_result['bscore'] + 0.05, 1.0)
+        full_result['bscore'] = round(boosted, 4)
+
+    return full_result
+
+
 # ==============================================================================
 # ANALYZER: CONTINUATION LOCAL (DNA-GPT PROXY)
 # ==============================================================================
@@ -5516,7 +5561,7 @@ def analyze_prompt(text, task_id='', occupation='', attempter='', stage='',
 
     cont_result = None
     if run_l3 and api_key:
-        cont_result = run_continuation_api(
+        cont_result = run_continuation_api_multi(
             text_for_analysis, api_key=api_key, provider=dna_provider,
             model=dna_model, n_samples=dna_samples,
         )
